@@ -3,12 +3,12 @@
  * @Descriptio
  * @Date: 2022-10-18 15:50:17
  * @LastEditors: jentle
- * @LastEditTime: 2022-10-19 10:04:44
+ * @LastEditTime: 2022-10-20 18:03:37
 -->
-# 一、基础方案和原理
-> 内含 demo，编译环境：gcc (x86_64-posix-seh-rev0, Built by MinGW-W64 project) 8.1.0
+# :star: 基础方案和原理
+> :point_right: 内含 demo，编译环境：gcc (x86_64-posix-seh-rev0, Built by MinGW-W64 project) 8.1.0
 
-## 1、IsDebuggerPresent
+## 1. :grin: IsDebuggerPresent
 代码示例：
 ```
 #include<stdio.h>
@@ -120,7 +120,7 @@ __declspec(allocate(".CRT$XLY"))PIMAGE_TLS_CALLBACK g_tlsCallback = TlsCallback;
        
 ```
 
-## 2. NtGlobalFlag 
+## 2.:grin: NtGlobalFlag 
 在 Windows NT 中，有一组标志存储在全局变量 NtGlobalFlag 中，这在整个系统中是通用的。在启动时，NtGlobalFlag 全局系统变量将使用系统注册表项中的值进行初始化：
 `[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Session Manager\GlobalFlag]`
 
@@ -217,7 +217,7 @@ void CheckGlobalFlagsClearInFile()
 
 </details>
 
-## 3.堆标志和 ForceFlags
+## 3. :smiley: 堆标志和 ForceFlags
 
 在PEB中包含两个特殊标志位结构：
 ```
@@ -296,7 +296,7 @@ void CheckHeap()
   
 ```
 
-## 4.检查 Trap Flag
+## 4. :smiley: 检查 Trap Flag
 陷阱标志（TF）位于EFLAGS寄存器内。如果 TF 设置为 1，CPU 将在每次指令执行后生成 INT 01h 或“单步”异常。以下反调试示例基于 TF 设置和异常调用检查：
 ```
 BOOL isDebugged = TRUE;
@@ -325,7 +325,7 @@ if (isDebugged)
 ### BYPASS
 遇到类似`pushfd`的时候小心点，不要单步，下断点也要在它后面。
 
-## 5. API CheckRemoteDebuggerPresent 和 NtQueryInformationProcess
+## 5. :grin: API CheckRemoteDebuggerPresent 和 NtQueryInformationProcess
 通过另外一个并行的程序检查目标程序是否在被调试：
 ```
 int main(int argc, char *argv[])
@@ -467,11 +467,11 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID lpvReserved)
 - ProcessDebugFlags 0x1F
 - ProcessBasicInformation 0x00
 
-## 6. ProcessDebugObjectHandle
+## 6. :grin: ProcessDebugObjectHandle
 
 
 
-# 附件
+# :shit: 附件
 <details>
 <summary>x64 _TEB 结构</summary>   
 
@@ -732,6 +732,6 @@ ntdll!_PEB
 ```
 </details>
 
-# 参考链接
-1. [367-anti-reverse-engineering-protection-techniques-to-use-before-releasing-software](367-anti-reverse-engineering-protection-techniques-to-use-before-releasing-software)
+# :+1: 参考链接
+1. [367-anti-reverse-engineering-protection-techniques-to-use-before-releasing-software](https://www.apriorit.com/dev-blog/367-anti-reverse-engineering-protection-techniques-to-use-before-releasing-software)
 2. 
