@@ -3,7 +3,7 @@
  * @Descriptio
  * @Date: 2022-10-18 15:50:17
  * @LastEditors: jentle
- * @LastEditTime: 2022-10-20 18:03:37
+ * @LastEditTime: 2022-10-20 20:37:41
 -->
 # :star: 基础方案和原理
 > :point_right: 内含 demo，编译环境：gcc (x86_64-posix-seh-rev0, Built by MinGW-W64 project) 8.1.0
@@ -397,6 +397,9 @@ int main(int argc, char *argv[])
 ```
 ### BYPASS
 通过hook api NtQueryInformationProcess 修改返回值，如用 [mhook](https://github.com/martona/mhook):
+
+<details>
+
 ```
 #include <Windows.h>
 #include "mhook.h"
@@ -461,6 +464,11 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID lpvReserved)
 } 
 ```
 
+</details>
+
+
+
+
 `NtQueryInformationProcess` 中其他可以用作判断调试标志位的：
 - ProcessDebugPort 0x07 – discussed above
 - ProcessDebugObjectHandle 0x1E
@@ -468,6 +476,167 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID lpvReserved)
 - ProcessBasicInformation 0x00
 
 ## 6. :grin: ProcessDebugObjectHandle
+从 Windows XP 开始，为调试的进程创建一个“调试对象”。下面是在当前进程中检查“调试对象”的示例：
+```
+status = NtQueryInformationProcess(
+            GetCurrentProcess(),
+            ProcessDebugObjectHandle,
+            &hProcessDebugObject,
+            sizeof(HANDLE),
+            NULL);
+if (0x00000000 == status && NULL != hProcessDebugObject)
+{
+    std::cout << "Stop debugging program!" << std::endl;
+    exit(-1);
+}
+```
+## 7. :smile: ProcessDebugFlags
+`EPROCESS` 内核结构中的 `NoDebugInherit`, 对应 `NtQueryInformationProcess` 的返回值如下
+```
+status = NtQueryInformationProcess(
+    GetCurrentProcess(),
+    ProcessDebugObjectHandle,
+    &debugFlags,
+    sizeof(ULONG),
+    NULL);
+if (0x00000000 == status && NULL != debugFlags)
+{
+    std::cout << "Stop debugging program!" << std::endl;
+    exit(-1);
+} 
+```
+## 8. ProcessBasicInformation
+调用带有 `ProcessBasicInformation` 标志的 `NtQueryInformationProcess `函数时，返回 `PROCESS_BASIC_INFORMATION` 结构如下：
+```
+typedef struct _PROCESS_BASIC_INFORMATION {
+    NTSTATUS ExitStatus;
+    PVOID PebBaseAddress;
+    ULONG_PTR AffinityMask;
+    KPRIORITY BasePriority;
+    HANDLE UniqueProcessId;
+    HANDLE InheritedFromUniqueProcessId;
+} PROCESS_BASIC_INFORMATION, *PPROCESS_BASIC_INFORMATION; 
+```
+通过 `InheritedFromUniqueProcessId ` 获取父进程的名字，并和常见的调试器进行比较来anti：
+<details>
+<summary>demo</summary>
+
+```
+std::wstring GetProcessNameById(DWORD pid)
+{
+    HANDLE hProcessSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hProcessSnap == INVALID_HANDLE_VALUE)
+    {
+        return 0;
+    }
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+    std::wstring processName = L"";
+    if (!Process32First(hProcessSnap, &pe32))
+    {
+        CloseHandle(hProcessSnap);
+        return processName;
+    }
+    do
+    {
+        if (pe32.th32ProcessID == pid)
+        {
+            processName = pe32.szExeFile;
+            break;
+        }
+    } while (Process32Next(hProcessSnap, &pe32));
+     
+    CloseHandle(hProcessSnap);
+    return processName;
+}
+status = NtQueryInformationProcess(
+    GetCurrentProcess(),
+    ProcessBasicInformation,
+    &processBasicInformation,
+    sizeof(PROCESS_BASIC_INFORMATION),
+    NULL);
+std::wstring parentProcessName = GetProcessNameById((DWORD)processBasicInformation.InheritedFromUniqueProcessId);
+if (L"devenv.exe" == parentProcessName)
+{
+    std::cout << "Stop debugging program!" << std::endl;
+    exit(-1);
+}
+```
+</details>
+
+
+所以对抗的方式可以总结为三点：
+  -  置 ProcessDebugObjectHandle 为 0
+  - 置 ProcessDebugFlags 为 1
+  - InheritedFromUniqueProcessId 设置成其他值
+
+## 9. :sunglasses: 软件断点
+检查 INT 3 (0xCC) 断点,下面的demo检查两个函数之间的长度：（ /INCREMENTAL:NO）
+```
+DWORD CalcFuncCrc(PUCHAR funcBegin, PUCHAR funcEnd)
+{
+    DWORD crc = 0;
+    for (; funcBegin < funcEnd; ++funcBegin)
+    {
+        crc += *funcBegin;
+    }
+    return crc;
+}
+#pragma auto_inline(off)
+VOID DebuggeeFunction()
+{
+    int calc = 0;
+    calc += 2;
+    calc <<= 8;
+    calc -= 3;
+}
+VOID DebuggeeFunctionEnd()
+{
+};
+#pragma auto_inline(on)
+DWORD g_origCrc = 0x2bd0;
+int main()
+{
+    DWORD crc = CalcFuncCrc((PUCHAR)DebuggeeFunction, (PUCHAR)DebuggeeFunctionEnd);
+    if (g_origCrc != crc)
+    {
+        std::cout << "Stop debugging program!" << std::endl;
+        exit(-1);
+    }
+    return 0;
+} 
+```
+
+BYPASS的方案就是发现类似的函数或者计算的时候，NOP掉或者其他。重在看见该方案。
+
+## 10. 硬件断点
+x86机构下的特殊硬件寄存器：
+  - DR0-DR3 – 断点寄存器
+  - DR4 & DR5 – 保留
+  - DR6 – 调试状态
+  - DR7 – 调试控制。
+
+
+通用方案：
+```
+CONTEXT ctx = {};
+ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+if (GetThreadContext(GetCurrentThread(), &ctx))
+{
+    if (ctx.Dr0 != 0 || ctx.Dr1 != 0 || ctx.Dr2 != 0 || ctx.Dr3 != 0)
+    {
+        std::cout << "Stop debugging program!" << std::endl;
+        exit(-1);
+    }
+}  
+```
+可以重置：
+```
+CONTEXT ctx = {};
+ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+SetThreadContext(GetCurrentThread(), &ctx); 
+```
+
 
 
 
