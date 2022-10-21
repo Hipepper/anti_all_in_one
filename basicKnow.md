@@ -3,7 +3,7 @@
  * @Descriptio
  * @Date: 2022-10-18 15:50:17
  * @LastEditors: jentle
- * @LastEditTime: 2022-10-20 20:37:41
+ * @LastEditTime: 2022-10-21 09:51:56
 -->
 # :star: 基础方案和原理
 > :point_right: 内含 demo，编译环境：gcc (x86_64-posix-seh-rev0, Built by MinGW-W64 project) 8.1.0
@@ -636,8 +636,133 @@ CONTEXT ctx = {};
 ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
 SetThreadContext(GetCurrentThread(), &ctx); 
 ```
+### BYPSS
+看一下`GetThreadContext `函数调用内部,调用了 `_imp__NtGetContextThread`:
+```
+KERNELBASE!GetThreadContext:
+7538d580 8bff            mov     edi,edi
+7538d582 55              push    ebp
+7538d583 8bec            mov     ebp,esp
+7538d585 ff750c          push    dword ptr [ebp+0Ch]
+7538d588 ff7508          push    dword ptr [ebp+8]
+7538d58b ff1504683975    call    dword ptr [KERNELBASE!_imp__NtGetContextThread (75396804)] 
+```
+bypass的思路就是修改 `CONTEXT` 结构中 `ContextFlags `中的 `CONTEXT_DEBUG_REGISTERS`标志位。并在原始调用结束后恢复线程环境。
+```
+typedef NTSTATUS(NTAPI *pfnNtGetContextThread)(
+    _In_  HANDLE             ThreadHandle,
+    _Out_ PCONTEXT           pContext
+    );
+typedef NTSTATUS(NTAPI *pfnNtSetContextThread)(
+    _In_ HANDLE              ThreadHandle,
+    _In_ PCONTEXT            pContext
+    );
+pfnNtGetContextThread g_origNtGetContextThread = NULL;
+pfnNtSetContextThread g_origNtSetContextThread = NULL;
+NTSTATUS NTAPI HookNtGetContextThread(
+    _In_  HANDLE              ThreadHandle,
+    _Out_ PCONTEXT            pContext)
+{
+    DWORD backupContextFlags = pContext->ContextFlags;
+    pContext->ContextFlags &= ~CONTEXT_DEBUG_REGISTERS;
+    NTSTATUS status = g_origNtGetContextThread(ThreadHandle, pContext);
+    pContext->ContextFlags = backupContextFlags;
+    return status;
+}
+NTSTATUS NTAPI HookNtSetContextThread(
+    _In_ HANDLE              ThreadHandle,
+    _In_ PCONTEXT            pContext)
+{
+    DWORD backupContextFlags = pContext->ContextFlags;
+    pContext->ContextFlags &= ~CONTEXT_DEBUG_REGISTERS;
+    NTSTATUS status = g_origNtSetContextThread(ThreadHandle, pContext);   
+    pContext->ContextFlags = backupContextFlags;
+    return status;
+}
+void HookThreadContext()
+{
+  HMODULE hNtDll = LoadLibrary(TEXT("ntdll.dll"));
+  g_origNtGetContextThread = (pfnNtGetContextThread)GetProcAddress(hNtDll, "NtGetContextThread");
+  g_origNtSetContextThread = (pfnNtSetContextThread)GetProcAddress(hNtDll, "NtSetContextThread");
+  Mhook_SetHook((PVOID*)&g_origNtGetContextThread, HookNtGetContextThread);
+  Mhook_SetHook((PVOID*)&g_origNtSetContextThread, HookNtSetContextThread);
+} 
+```
 
+## 11. :shit: SEH (Structured Exception Handling)
+SEH链地址在fs/gs寄存器的0偏移位置，指向`_EXCEPTION_REGISTRATION_RECORD`结构：
+```
+0:000> dt ntdll!_EXCEPTION_REGISTRATION_RECORD
+   +0x000 Next             : Ptr32 _EXCEPTION_REGISTRATION_RECORD
+   +0x004 Handler          : Ptr32 _EXCEPTION_DISPOSITION 
+```
+当处理异常时，优先使用程序的异常处理程序，并返回`_EXCEPTION_DISPOSITION`结果：
+```
+typedef enum _EXCEPTION_DISPOSITION {
+    ExceptionContinueExecution,
+    ExceptionContinueSearch,
+    ExceptionNestedException,
+    ExceptionCollidedUnwind
+} EXCEPTION_DISPOSITION;
+```
+而如果返回的是`ExceptionContinueSearch`，就代表当前SEH无法处理，继续查找，可以通过 `!exchain`查看：
+```
+0:000> !exchain
+00a5f3bc: AntiDebug!_except_handler4+0 (008b7530)
+  CRT scope  0, filter: AntiDebug!SehInternals+67 (00883d67)
+                func:   AntiDebug!SehInternals+6d (00883d6d)
+00a5f814: AntiDebug!__scrt_stub_for_is_c_termination_complete+164b (008bc16b)
+00a5f87c: AntiDebug!_except_handler4+0 (008b7530)
+  CRT scope  0, filter: AntiDebug!__scrt_common_main_seh+1b0 (008b7c60)
+                func:   AntiDebug!__scrt_common_main_seh+1cb (008b7c7b)
+00a5f8e8: ntdll!_except_handler4+0 (775674a0)
+  CRT scope  0, filter: ntdll!__RtlUserThreadStart+54386 (7757f076)
+                func:   ntdll!__RtlUserThreadStart+543cd (7757f0bd)
+00a5f900: ntdll!FinalExceptionHandlerPad4+0 (77510213)
+```
+注册表中存着系统SEH默认项：
+`HKEY_LOCAL_MACHINE\Software\Microsoft\Windows NT\CurrentVersion\AeDebug`
 
+调试器中 INT3 后会接管程序控制，所以可以通过SEH检查反调试：
+```
+BOOL g_isDebuggerPresent = TRUE;
+EXCEPTION_DISPOSITION ExceptionRoutine(
+    PEXCEPTION_RECORD ExceptionRecord,
+    PVOID             EstablisherFrame,
+    PCONTEXT          ContextRecord,
+    PVOID             DispatcherContext)
+{
+    g_isDebuggerPresent = FALSE;
+    ContextRecord->Eip += 1;
+    return ExceptionContinueExecution;
+}
+int main()
+{
+    __asm
+    {
+        // 设置 SEH handler
+        push ExceptionRoutine
+        push dword ptr fs:[0]
+        mov  dword ptr fs:[0], esp
+        // 生成中断
+        int  3h
+        // 返回原始 SEH handler
+        mov  eax, [esp]
+        mov  dword ptr fs:[0], eax
+        add  esp, 8
+    }
+    if (g_isDebuggerPresent)
+    {
+        std::cout << "Stop debugging program!" << std::endl;
+        exit(-1);
+    }
+    return 0
+} 
+```
+上面这段程序在SEH链中插入一个新的异常处理，如果INT 3 之后进入的是该SEH，那么`g_isDebuggerPresent`接受到被置为FALSE，并继续下一个SEH处理，反之如果调试器接受到的话就是 TRUE 带入后面判断。
+
+### BYPSS
+数据调用SEH会调用`ExecuteHandler2`
 
 
 # :shit: 附件
