@@ -3,7 +3,7 @@
  * @Descriptio
  * @Date: 2022-10-18 15:50:17
  * @LastEditors: jentle
- * @LastEditTime: 2022-10-21 09:51:56
+ * @LastEditTime: 2022-10-24 15:34:16
 -->
 # :star: 基础方案和原理
 > :point_right: 内含 demo，编译环境：gcc (x86_64-posix-seh-rev0, Built by MinGW-W64 project) 8.1.0
@@ -762,7 +762,257 @@ int main()
 上面这段程序在SEH链中插入一个新的异常处理，如果INT 3 之后进入的是该SEH，那么`g_isDebuggerPresent`接受到被置为FALSE，并继续下一个SEH处理，反之如果调试器接受到的话就是 TRUE 带入后面判断。
 
 ### BYPSS
-数据调用SEH会调用`ExecuteHandler2`
+数据调用SEH会调用`ExecuteHandler2`，该函数是所有SEH的起点，断点到这，然后逐个跟踪~~~~ :tada:
+```
+0:000> u ntdll!ExecuteHandler2+24 L3
+ntdll!ExecuteHandler2+0x24:
+775100af ffd1            call    ecx
+775100b1 648b2500000000  mov     esp,dword ptr fs:[0]
+775100b8 648f0500000000  pop     dword ptr fs:[0]
+```
+
+## 12. VEH (Vectored Exception Handler)
+VEH 链路保存在`ntdll!LdrpVectorHandlerListIt ` 中，它和SEH不互相冲突，区别在于VEH的创建，删除和签名：
+```
+PVOID WINAPI AddVectoredExceptionHandler(
+    ULONG                       FirstHandler,
+    PVECTORED_EXCEPTION_HANDLER VectoredHandler
+);
+ULONG WINAPI RemoveVectoredExceptionHandler(
+    PVOID Handler
+);
+LONG CALLBACK VectoredHandler(
+    PEXCEPTION_POINTERS ExceptionInfo
+);
+The _EXCEPTION_POINTERS structure looks like this:  
+typedef struct _EXCEPTION_POINTERS {
+  PEXCEPTION_RECORD ExceptionRecord;
+  PCONTEXT          ContextRecord;
+} EXCEPTION_POINTERS, *PEXCEPTION_POINTERS; 
+```
+收到系统控制之后，通过`ContextRecord ` 参数传递保存的上下文结构，demo:
+```
+LONG CALLBACK ExceptionHandler(PEXCEPTION_POINTERS ExceptionInfo)
+{
+    PCONTEXT ctx = ExceptionInfo->ContextRecord;
+    if (ctx->Dr0 != 0 || ctx->Dr1 != 0 || ctx->Dr2 != 0 || ctx->Dr3 != 0)
+    {
+        std::cout << "Stop debugging program!" << std::endl;
+        exit(-1);
+    }
+    ctx->Eip += 2;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+int main()
+{
+    AddVectoredExceptionHandler(0, ExceptionHandler);
+    __asm int 1h;
+    return 0;
+}
+```
+我们设置了一个 VEH 处理程序并生成了中断（int 1h非必须）。生成中断时，将显示异常，并将控制权转移到 VEH 处理程序。此时检查硬件断点。如果没有硬件断点，则 EIP 寄存器值增加 2，以便在 int 1h 指令后继续执行。
+
+### BYPSS
+上面的程序，我们可以通过：
+```
+0:000> kn
+ # ChildEBP RetAddr  
+00 001cf21c 774d6822 AntiDebug!ExceptionHandler 
+01 001cf26c 7753d151 ntdll!RtlpCallVectoredHandlers+0xba
+02 001cf304 775107ff ntdll!RtlDispatchException+0x72
+03 001cf304 00bf4a69 ntdll!KiUserExceptionDispatcher+0xf
+04 001cfc1c 00c2680e AntiDebug!main+0x59 
+05 001cfc30 00c2665a AntiDebug!invoke_main+0x1e 
+06 001cfc88 00c264ed AntiDebug!__scrt_common_main_seh+0x15a 
+07 001cfc90 00c26828 AntiDebug!__scrt_common_main+0xd 
+08 001cfc98 753e7c04 AntiDebug!mainCRTStartup+0x8 
+09 001cfcac 7752ad1f KERNEL32!BaseThreadInitThunk+0x24
+0a 001cfcf4 7752acea ntdll!__RtlUserThreadStart+0x2f
+0b 001cfd04 00000000 ntdll!_RtlUserThreadStart+0x1b 
+```
+可以看到函数在调用`main+0x59 `之前，调用了 `ntdll!KiUserExceptionDispatcher`,而`main+0x59 `位置就是：
+```
+0:000> u main+59 L1
+AntiDebug!main+0x59
+00bf4a69 cd02            int     1 
+```
+所以我们可以hook `ntdll!KiUserExceptionDispatcher`,
+```
+typedef  VOID (NTAPI *pfnKiUserExceptionDispatcher)(
+    PEXCEPTION_RECORD pExcptRec,
+    PCONTEXT ContextFrame
+    );
+pfnKiUserExceptionDispatcher g_origKiUserExceptionDispatcher = NULL;
+VOID NTAPI HandleKiUserExceptionDispatcher(PEXCEPTION_RECORD pExcptRec, PCONTEXT ContextFrame)
+{
+    if (ContextFrame && (CONTEXT_DEBUG_REGISTERS & ContextFrame->ContextFlags))
+    {
+        ContextFrame->Dr0 = 0;
+        ContextFrame->Dr1 = 0;
+        ContextFrame->Dr2 = 0;
+        ContextFrame->Dr3 = 0;
+        ContextFrame->Dr6 = 0;
+        ContextFrame->Dr7 = 0;
+        ContextFrame->ContextFlags &= ~CONTEXT_DEBUG_REGISTERS;
+    }
+}
+__declspec(naked) VOID NTAPI HookKiUserExceptionDispatcher() 
+// Params: PEXCEPTION_RECORD pExcptRec, PCONTEXT ContextFrame
+{
+    __asm
+    {
+        mov eax, [esp + 4]
+        mov ecx, [esp]
+        push eax
+        push ecx
+        call HandleKiUserExceptionDispatcher
+        jmp g_origKiUserExceptionDispatcher
+    }
+}
+int main()
+{
+    HMODULE hNtDll = LoadLibrary(TEXT("ntdll.dll"));
+    g_origKiUserExceptionDispatcher = (pfnKiUserExceptionDispatcher)GetProcAddress(hNtDll, "KiUserExceptionDispatcher");
+    Mhook_SetHook((PVOID*)&g_origKiUserExceptionDispatcher, HookKiUserExceptionDispatcher);
+    return 0;
+}
+```
+上面的例子中，在调用`HookKiUserExceptionDispatcher` 重置 DRx寄存器，也就是在VEH前。
+
+## 13.NtSetInformationThreadIt
+> 隐藏线程
+
+在Windows 2000中，出现了传输到`NtSetInformationThread`函数的线程信息——`ThreadHideFromDebugger`。这是Windows提供的第一个反调试技术之一，用于微软搜索如何防止逆向，它非常强大。如果为线程设置了此标志，则该线程将停止发送有关调试事件的通知。这些事件包括断点和程序完成通知。此标志的值存储在`_ETHREAD`结构的`HideFromDebugger`字段中：
+```
+> dt _ETHREAD HideFromDebugger 86bfada8
+ntdll!_ETHREAD
+   +0x248 HideFromDebugger : 0y1 
+```
+下面是一个设置`ThreadHideFromDebugger`例子：
+```
+typedef NTSTATUS (NTAPI *pfnNtSetInformationThread)(
+    _In_ HANDLE ThreadHandle,
+    _In_ ULONG  ThreadInformationClass,
+    _In_ PVOID  ThreadInformation,
+    _In_ ULONG  ThreadInformationLength
+    );
+const ULONG ThreadHideFromDebugger = 0x11;
+void HideFromDebugger()
+{
+    HMODULE hNtDll = LoadLibrary(TEXT("ntdll.dll"));
+    pfnNtSetInformationThread NtSetInformationThread = (pfnNtSetInformationThread)
+        GetProcAddress(hNtDll, "NtSetInformationThread");
+    NTSTATUS status = NtSetInformationThread(GetCurrentThread(), 
+        ThreadHideFromDebugger, NULL, 0);
+}
+```
+对抗的方法就是hook `NtSetInformationThread`:
+```
+pfnNtSetInformationThread g_origNtSetInformationThread = NULL;
+NTSTATUS NTAPI HookNtSetInformationThread(
+    _In_ HANDLE ThreadHandle,
+    _In_ ULONG  ThreadInformationClass,
+    _In_ PVOID  ThreadInformation,
+    _In_ ULONG  ThreadInformationLength
+    )
+{
+    if (ThreadInformationClass == ThreadHideFromDebugger && 
+        ThreadInformation == 0 && ThreadInformationLength == 0)
+    {
+        return STATUS_SUCCESS;
+    }
+    return g_origNtSetInformationThread(ThreadHandle, 
+        ThreadInformationClass, ThreadInformation, ThreadInformationLength
+}
+                                         
+void SetHook()
+{
+    HMODULE hNtDll = LoadLibrary(TEXT("ntdll.dll"));
+    if (NULL != hNtDll)
+    {
+        g_origNtSetInformationThread = (pfnNtSetInformationThread)GetProcAddress(hNtDll, "NtSetInformationThread");
+        if (NULL != g_origNtSetInformationThread)
+        {
+            Mhook_SetHook((PVOID*)&g_origNtSetInformationThread, HookNtSetInformationThread);
+        }
+    }
+}
+```
+返回 `STATUS_SUCCESS `,而不是调用 `NtSetInformationThread`
+
+## 14.:last_quarter_moon:NtCreateThreadEx
+Vista之后引入的结构`NtCreateThreadEx `，如下：
+```
+NTSTATUS NTAPI NtCreateThreadEx (
+    _Out_    PHANDLE              ThreadHandle,
+    _In_     ACCESS_MASK          DesiredAccess,
+    _In_opt_ POBJECT_ATTRIBUTES   ObjectAttributes,
+    _In_     HANDLE               ProcessHandle,
+    _In_     PVOID                StartRoutine,
+    _In_opt_ PVOID                Argument,
+    _In_     ULONG                CreateFlags,
+    _In_opt_ ULONG_PTR            ZeroBits,
+    _In_opt_ SIZE_T               StackSize,
+    _In_opt_ SIZE_T               MaximumStackSize,
+    _In_opt_ PVOID                AttributeList
+);
+```
+其中 `CreateFlags` 结果如下：
+```
+#define THREAD_CREATE_FLAGS_CREATE_SUSPENDED 0x00000001
+#define THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH 0x00000002
+#define THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER 0x00000004
+#define THREAD_CREATE_FLAGS_HAS_SECURITY_DESCRIPTOR 0x00000010
+#define THREAD_CREATE_FLAGS_ACCESS_CHECK_IN_TARGET 0x00000020
+#define THREAD_CREATE_FLAGS_INITIAL_THREAD 0x00000080
+```
+如果一个新线程获得thread_CREATE_FLAGS_HIDE_FROM_DEBUGGER标志，那么它将在创建时对调试器隐藏。这是由NtSetInformationThread函数设置的和ThreadHideFromDebugger一样。负责安全任务的代码可以在设置了thread_CREATE_FLAGS_HIDE_FROM_DEBUGGER标志的线程中执行。
+
+对抗的方法就是 hook NtCreateThreadEx 并重置 `THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER`
+
+## 15.:jack_o_lantern: Handle tracing(句柄跟踪)
+从Windows XP开始，Windows系统就有了内核对象句柄跟踪机制。当跟踪模式打开时，所有带有处理程序的操作都会保存到循环缓冲区中，此外，当尝试使用不存在的处理程序时，例如使用CloseHandle函数关闭它时，将生成EXCEPTION_INVALID_HANDLE异常。如果进程不是从调试器启动的，CloseHandle函数将返回FALSE。以下示例显示了基于CloseHandle的反调试保护：
+```
+EXCEPTION_DISPOSITION ExceptionRoutine(
+    PEXCEPTION_RECORD ExceptionRecord,
+    PVOID             EstablisherFrame,
+    PCONTEXT          ContextRecord,
+    PVOID             DispatcherContext)
+{
+    if (EXCEPTION_INVALID_HANDLE == ExceptionRecord->ExceptionCode)
+    {
+        std::cout << "Stop debugging program!" << std::endl;
+        exit(-1);
+    }
+    return ExceptionContinueExecution;
+}
+int main()
+{
+    __asm
+    {
+        // 设置 SEH handler
+        push ExceptionRoutine
+        push dword ptr fs : [0]
+        mov  dword ptr fs : [0], esp
+    }
+    CloseHandle((HANDLE)0xBAAD);
+    __asm
+    {
+        // 返回原始 SEH handler
+        mov  eax, [esp]
+        mov  dword ptr fs : [0], eax
+        add  esp, 8
+    }
+    return 0
+} 
+```
+
+## :bath:总结：
+这只是沧海一粟的方案，推荐阅读：
+1. [内存反调试](https://sidechannel.tempestsi.com/ba-ad-f0-0d-using-memory-debug-code-as-an-anti-debugging-technique-116666184beb)
+2. `NtQueryObject`
+3. [计时器方案](https://www.apriorit.com/dev-blog/298-anti-debug-time-plugin)
+4. `NtSetDebugFilterState`
 
 
 # :shit: 附件
@@ -1027,5 +1277,6 @@ ntdll!_PEB
 </details>
 
 # :+1: 参考链接
-1. [367-anti-reverse-engineering-protection-techniques-to-use-before-releasing-software](https://www.apriorit.com/dev-blog/367-anti-reverse-engineering-protection-techniques-to-use-before-releasing-software)
-2. 
+1. [anti-reverse-engineering-protection-techniques-to-use-before-releasing-software](https://www.apriorit.com/dev-blog/367-anti-reverse-engineering-protection-techniques-to-use-before-releasing-software)
+2. [How to Reverse Engineer Software (Windows) in a Right Way](https://www.apriorit.com/dev-blog/364-how-to-reverse-engineer-software-windows-in-a-right-way)
+3. [opeenACE](http://www.openrce.org/articles/)
