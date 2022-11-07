@@ -347,3 +347,162 @@ int main(void)
     return 0;
 }
 ```
+
+# 🚲根据CPU滴答
+> 主要原理就是程序运行的时间和调试时指令运行时间的差异来判断是否调试
+当在调试器中跟踪进程时，指令和执行之间存在延迟。可以使用几种方法测量代码某些部分之间的“本地”延迟，并将其与实际延迟进行比较。
+
+你也可以自己设置一个时间上限，在 `... ...`位置放入一个函数，并检测运行时间做diff。
+## 1.😁RDPMC/RDTSC
+这些指令要求在CR4寄存器中设置标志PCE，并且 `RDPMC` 指令只能在内核，`RDTSC`是在用户层上。
+```
+bool IsDebugged(DWORD64 qwNativeElapsed)
+{
+    ULARGE_INTEGER Start, End;
+    __asm
+    {
+        xor  ecx, ecx
+        rdpmc
+        mov  Start.LowPart, eax
+        mov  Start.HighPart, edx
+    }
+    // ... ....
+    __asm
+    {
+        xor  ecx, ecx
+        rdpmc
+        mov  End.LowPart, eax
+        mov  End.HighPart, edx
+    }
+    return (End.QuadPart - Start.QuadPart) > qwNativeElapsed;
+}
+
+
+bool IsDebugged(DWORD64 qwNativeElapsed)
+{
+    ULARGE_INTEGER Start, End;
+    __asm
+    {
+        xor  ecx, ecx
+        rdtsc
+        mov  Start.LowPart, eax
+        mov  Start.HighPart, edx
+    }
+    // ... ....
+    __asm
+    {
+        xor  ecx, ecx
+        rdtsc
+        mov  End.LowPart, eax
+        mov  End.HighPart, edx
+    }
+    return (End.QuadPart - Start.QuadPart) > qwNativeElapsed; // 计算延迟
+}
+```
+## 2. 😎GetLocalTime()
+
+```
+bool IsDebugged(DWORD64 qwNativeElapsed)
+{
+    SYSTEMTIME stStart, stEnd;
+    FILETIME ftStart, ftEnd;
+    ULARGE_INTEGER uiStart, uiEnd;
+
+    GetLocalTime(&stStart);
+    // ... ...
+    GetLocalTime(&stEnd);
+
+    if (!SystemTimeToFileTime(&stStart, &ftStart))
+        return false;
+    if (!SystemTimeToFileTime(&stEnd, &ftEnd))
+        return false;
+
+    uiStart.LowPart  = ftStart.dwLowDateTime;
+    uiStart.HighPart = ftStart.dwHighDateTime;
+    uiEnd.LowPart  = ftEnd.dwLowDateTime;
+    uiEnd.HighPart = ftEnd.dwHighDateTime;
+    return (uiEnd.QuadPart - uiStart.QuadPart) > qwNativeElapsed;
+}
+
+```
+## 3.GetSystemTime()
+```
+bool IsDebugged(DWORD64 qwNativeElapsed)
+{
+    SYSTEMTIME stStart, stEnd;
+    FILETIME ftStart, ftEnd;
+    ULARGE_INTEGER uiStart, uiEnd;
+
+    GetSystemTime(&stStart);
+    // ... ...
+    GetSystemTime(&stEnd);
+
+    if (!SystemTimeToFileTime(&stStart, &ftStart))
+        return false;
+    if (!SystemTimeToFileTime(&stEnd, &ftEnd))
+        return false;
+
+    uiStart.LowPart  = ftStart.dwLowDateTime;
+    uiStart.HighPart = ftStart.dwHighDateTime;
+    uiEnd.LowPart  = ftEnd.dwLowDateTime;
+    uiEnd.HighPart = ftEnd.dwHighDateTime;
+    return (uiEnd.QuadPart - uiStart.QuadPart) > qwNativeElapsed;
+}
+```
+## 4.GetTickCount()
+```
+bool IsDebugged(DWORD dwNativeElapsed)
+{
+    DWORD dwStart = GetTickCount();
+    // ... some work
+    return (GetTickCount() - dwStart) > dwNativeElapsed;
+}
+```
+## 5.ZwGetTickCount() / KiGetTickCount()
+
+这两个函数仅在内核模式下使用。和用户模式一样，都从`KUSER_SHARED_DATA `页面中获取数据，此页面以只读方式映射到虚拟地址的用户模式范围中，并在内核范围中读写。系统时钟滴答更新系统时间，该时间直接存储在此页面中。
+
+`ZwGetTickCount()` 和 `GetTickCount()` 使用方式一样.  `KiGetTickCount()` 比调用 `ZwGetTickCount()` 快, 但是比直接读取 `KUSER_SHARED_DATA` 页面慢。
+
+```
+bool IsDebugged(DWORD64 qwNativeElapsed)
+{
+    ULARGE_INTEGER Start, End;
+    __asm
+    {
+        int  2ah
+        mov  Start.LowPart, eax
+        mov  Start.HighPart, edx
+    }
+    // ... ...
+    __asm
+    {
+        int  2ah
+        mov  End.LowPart, eax
+        mov  End.HighPart, edx
+    }
+    return (End.QuadPart - Start.QuadPart) > qwNativeElapsed;
+}
+```
+
+## 6.QueryPerformanceCounter()
+```
+bool IsDebugged(DWORD64 qwNativeElapsed)
+{
+    LARGE_INTEGER liStart, liEnd;
+    QueryPerformanceCounter(&liStart);
+    // ......
+    QueryPerformanceCounter(&liEnd);
+    return (liEnd.QuadPart - liStart.QuadPart) > qwNativeElapsed;
+}
+```
+
+## 7.timeGetTime()
+```
+bool IsDebugged(DWORD dwNativeElapsed)
+{
+    DWORD dwStart = timeGetTime();
+    // ... some work
+    return (timeGetTime() - dwStart) > dwNativeElapsed;
+}
+```
